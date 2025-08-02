@@ -90,7 +90,7 @@ class Config:
     
     # Gemini Configuration
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    GEMINI_MODEL = "gemini-1.5-flash-latest"
+    GEMINI_MODEL = "gemini-2.5-flash-lite"
     
     # LLM Provider Selection
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()  # "openai" or "gemini"
@@ -754,7 +754,7 @@ async def health_check():
     }
 
 # --- START: MODIFIED ENDPOINT WITH AUTHENTICATION DEPENDENCY ---
-@app.post("/hackrx/run", response_model=QueryResponse)
+@app.post("/hackrx/run")
 async def run_hackrx_submission(
     request: QueryRequest,
     auth_key: HTTPAuthorizationCredentials = Depends(verify_hackrx_api_key)
@@ -770,28 +770,13 @@ async def run_hackrx_submission(
         answers = await retrieval_system.process_queries(document_id, request.questions)
         
         # Calculate total processing time
-        processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+        
         
         # Step 6: JSON Output
-        return QueryResponse(
-            answers=answers,
-            processing_time=processing_time,
-            metadata={
-                "document_id": document_id,
-                "question_count": len(request.questions),
-                "system_version": "2.0.0",
-                "llm_provider": Config.LLM_PROVIDER,
-                "workflow_steps_completed": [
-                    "1. Input Documents ✓",
-                    "2. LLM Parser ✓", 
-                    "3. Embedding Search ✓",
-                    "4. Clause Matching ✓",
-                    "5. Logic Evaluation ✓",
-                    "6. JSON Output ✓"
-                ]
-            }
-        )
-        
+        return {
+            "answers": answers,
+        }
+
     except Exception as e:
         logger.error(f"Error in hackrx/run endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
@@ -803,10 +788,10 @@ async def get_available_models():
     return {
         "current_provider": Config.LLM_PROVIDER,
         "available_providers": {
-            "openai": {
-                "available": bool(Config.OPENAI_API_KEY),
-                "model": Config.OPENAI_MODEL if Config.OPENAI_API_KEY else "not configured"
-            },
+            # "openai": {
+            #     "available": bool(Config.OPENAI_API_KEY),
+            #     "model": Config.OPENAI_MODEL if Config.OPENAI_API_KEY else "not configured"
+            # },
             "gemini": {
                 "available": bool(GEMINI_AVAILABLE and Config.GEMINI_API_KEY),
                 "model": Config.GEMINI_MODEL if (GEMINI_AVAILABLE and Config.GEMINI_API_KEY) else "not configured"
