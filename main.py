@@ -9,6 +9,7 @@ import os
 import json
 import asyncio
 import logging
+import re
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
@@ -105,8 +106,9 @@ class Config:
     
     # Embedding Configuration
     EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Lightweight and efficient
-    CHUNK_SIZE = 512  # Token-efficient chunking
-    CHUNK_OVERLAP = 50
+    CHUNK_SIZE = 1024  # Improved chunking for better context preservation
+    CHUNK_OVERLAP = 200  # Increased overlap to ensure continuity
+    MAX_CHUNKS_PER_QUERY = 8  # Increase from 5 for more comprehensive search
 
 # Database Models (commented out for stateless operation)
 # Base = declarative_base()
@@ -250,43 +252,73 @@ class DocumentProcessor:
 class TextChunker:
     """Intelligent text chunking for optimal token usage"""
     
-    def __init__(self, chunk_size: int = 512, overlap: int = 50):
+    def __init__(self, chunk_size: int = 1024, overlap: int = 200):
         self.chunk_size = chunk_size
         self.overlap = overlap
     
     def chunk_text(self, text: str, metadata: Dict[str, Any] = None) -> List[DocumentChunk]:
-        """Split text into overlapping chunks"""
+        """Split text into overlapping chunks with improved strategy"""
         if metadata is None:
             metadata = {}
         
-        # Simple sentence-aware chunking
-        sentences = text.split('. ')
+        # Enhanced chunking with multiple strategies
         chunks = []
+        
+        # Strategy 1: Paragraph-based chunking for better context
+        paragraphs = text.split('\n\n')
         current_chunk = ""
         
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) < self.chunk_size:
-                current_chunk += sentence + ". "
+        for paragraph in paragraphs:
+            # If paragraph is too long, split by sentences
+            if len(paragraph) > self.chunk_size:
+                sentences = paragraph.split('. ')
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) < self.chunk_size:
+                        current_chunk += sentence + ". "
+                    else:
+                        if current_chunk:
+                            chunks.append(self._create_chunk(current_chunk.strip(), metadata))
+                        current_chunk = self._create_overlap(chunks, sentence + ". ")
             else:
-                if current_chunk:
-                    chunk_id = hashlib.md5(current_chunk.encode()).hexdigest()[:8]
-                    chunks.append(DocumentChunk(
-                        content=current_chunk.strip(),
-                        metadata={**metadata, 'chunk_id': chunk_id},
-                        chunk_id=chunk_id
-                    ))
-                
-                # Start new chunk with overlap
-                current_chunk = sentence + ". "
+                # Add whole paragraph if it fits
+                if len(current_chunk) + len(paragraph) < self.chunk_size:
+                    current_chunk += paragraph + "\n\n"
+                else:
+                    if current_chunk:
+                        chunks.append(self._create_chunk(current_chunk.strip(), metadata))
+                    current_chunk = self._create_overlap(chunks, paragraph + "\n\n")
         
         # Add final chunk
-        if current_chunk:
-            chunk_id = hashlib.md5(current_chunk.encode()).hexdigest()[:8]
-            chunks.append(DocumentChunk(
-                content=current_chunk.strip(),
-                metadata={**metadata, 'chunk_id': chunk_id},
-                chunk_id=chunk_id
-            ))
+        if current_chunk.strip():
+            chunks.append(self._create_chunk(current_chunk.strip(), metadata))
+        
+        return chunks
+    
+    def _create_chunk(self, content: str, metadata: Dict[str, Any]) -> DocumentChunk:
+        """Create a chunk with proper ID and metadata"""
+        chunk_id = hashlib.md5(content.encode()).hexdigest()[:8]
+        return DocumentChunk(
+            content=content,
+            metadata={**metadata, 'chunk_id': chunk_id, 'length': len(content)},
+            chunk_id=chunk_id
+        )
+    
+    def _create_overlap(self, existing_chunks: List[DocumentChunk], new_content: str) -> str:
+        """Create overlap from previous chunk to maintain context"""
+        if not existing_chunks or self.overlap <= 0:
+            return new_content
+        
+        last_chunk = existing_chunks[-1].content
+        # Take last N characters for overlap
+        overlap_text = last_chunk[-self.overlap:] if len(last_chunk) > self.overlap else last_chunk
+        
+        # Find good break point (sentence or word boundary)
+        if '. ' in overlap_text:
+            overlap_text = overlap_text[overlap_text.rfind('. ') + 2:]
+        elif ' ' in overlap_text:
+            overlap_text = overlap_text[overlap_text.rfind(' ') + 1:]
+        
+        return overlap_text + " " + new_content
         
         return chunks
 
@@ -381,7 +413,7 @@ class EmbeddingService:
             logger.error(f"Error storing chunks: {e}")
             raise
     
-    async def search_similar(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    async def search_similar(self, query: str, k: int = 8) -> List[Dict[str, Any]]:
         """Search for similar chunks - Step 4: Clause Matching"""
         try:
             query_embedding = self.model.encode([query], convert_to_numpy=True)
@@ -422,106 +454,43 @@ class EmbeddingService:
         except Exception as e:
             logger.error(f"Error searching: {e}")
             return []
-
-class LLMService:
-    """Handles OpenAI LLM interactions - Step 2 & 5: LLM Parser and Logic Evaluation"""
     
-    def __init__(self):
-        if not Config.OPENAI_API_KEY:
-            raise ValueError("OpenAI API key is required")
+    async def enhanced_similarity_search(self, query: str, top_k: int = 8) -> List[Dict[str, Any]]:
+        """Enhanced search with multiple query variations"""
         
-        self.provider = "openai"
+        # Original query
+        results = await self.search_similar(query, top_k//2)
+        
+        # Add keyword-based search variations
+        keywords = self._extract_keywords(query)
+        for keyword in keywords[:3]:  # Top 3 keywords
+            keyword_results = await self.search_similar(keyword, top_k//4)
+            results.extend(keyword_results)
+        
+        # Remove duplicates and re-rank
+        unique_results = self._deduplicate_chunks(results)
+        return sorted(unique_results, key=lambda x: x.get('score', 0), reverse=True)[:top_k]
     
-    async def generate_answer(self, query: str, context_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Generate answer using OpenAI with retrieved context"""
-        try:
-            # Prepare context
-            context = "\n\n".join([
-                f"[Context {i+1}]: {chunk['content']}"
-                for i, chunk in enumerate(context_chunks[:3])  # Limit context for token efficiency
-            ])
-            
-            # Create prompt
-            prompt = self._create_answer_prompt(query, context)
-            
-            # Generate response
-            response = self.client.chat.completions.create(
-                model=Config.OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are an expert at analyzing insurance, legal, HR, and compliance documents. Provide accurate, specific answers based on the given context."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,  # Low temperature for consistency
-                max_tokens=300,  # Token-efficient response
-            )
-            
-            answer = response.choices[0].message.content.strip()
-            
-            # Extract reasoning and sources
-            reasoning = self._extract_reasoning(context_chunks)
-            
-            return {
-                'answer': answer,
-                'reasoning': reasoning,
-                'sources': [chunk['metadata'].get('chunk_id', 'unknown') for chunk in context_chunks[:3]],
-                'confidence': self._calculate_confidence(context_chunks),
-                'provider': self.provider
-            }
-            
-        except Exception as e:
-            logger.error(f"Error generating answer with OpenAI: {e}")
-            return {
-                'answer': f"I apologize, but I encountered an error processing your query: {str(e)}",
-                'reasoning': "Error occurred during processing",
-                'sources': [],
-                'confidence': 0.0,
-                'provider': self.provider
-            }
+    def _extract_keywords(self, query: str) -> List[str]:
+        """Extract key terms from query"""
+        # Remove common words and extract meaningful terms
+        stop_words = {'what', 'is', 'the', 'are', 'how', 'long', 'should', 'be', 'for', 'in', 'to', 'of', 'and', 'a', 'an'}
+        words = query.lower().replace('?', '').replace(',', '').split()
+        keywords = [w for w in words if w not in stop_words and len(w) > 2]
+        return keywords
     
-    def _create_answer_prompt(self, query: str, context: str) -> str:
-        """Create optimized prompt for answer generation"""
-        return f"""Based on the following context from the document, answer the question accurately and specifically.
-
-Context:
-{context}
-
-Question: {query}
-
-Instructions:
-- Provide a direct, specific answer based only on the context provided
-- If the context doesn't contain enough information, state that clearly
-- Include specific details like waiting periods, coverage amounts, conditions, etc.
-- Be concise but complete
-
-Answer:"""
-    
-    def _extract_reasoning(self, context_chunks: List[Dict[str, Any]]) -> str:
-        """Extract reasoning from context chunks"""
-        if not context_chunks:
-            return "No relevant context found"
+    def _deduplicate_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove duplicate chunks based on content similarity"""
+        unique_chunks = []
+        seen_contents = set()
         
-        reasoning_parts = []
-        for i, chunk in enumerate(context_chunks[:2]):  # Top 2 chunks
-            score = chunk.get('score', 0)
-            reasoning_parts.append(f"Context {i+1} (relevance: {score:.2f}): {chunk['content'][:100]}...")
+        for chunk in chunks:
+            content_hash = hashlib.md5(chunk.get('content', '').encode()).hexdigest()
+            if content_hash not in seen_contents:
+                seen_contents.add(content_hash)
+                unique_chunks.append(chunk)
         
-        return " | ".join(reasoning_parts)
-    
-    def _calculate_confidence(self, context_chunks: List[Dict[str, Any]]) -> float:
-        """Calculate confidence score based on retrieval scores"""
-        if not context_chunks:
-            return 0.0
-        
-        # Average of top chunk scores, weighted by position
-        weights = [1.0, 0.8, 0.6, 0.4, 0.2]
-        weighted_scores = []
-        
-        for i, chunk in enumerate(context_chunks[:5]):
-            score = chunk.get('score', 0)
-            weight = weights[i] if i < len(weights) else 0.1
-            weighted_scores.append(score * weight)
-        
-        return sum(weighted_scores) / sum(weights[:len(weighted_scores)]) if weighted_scores else 0.0
+        return unique_chunks
 
 class GeminiService:
     """Handles Google Gemini LLM interactions - Step 2 & 5: LLM Parser and Logic Evaluation"""
@@ -584,18 +553,26 @@ class GeminiService:
     
     def _create_answer_prompt(self, query: str, context: str) -> str:
         """Create optimized prompt for Gemini answer generation"""
-        return f"""You are an expert at analyzing insurance, legal, HR, and compliance documents. Based on the following context from the document, answer the question accurately and specifically.
+        return f"""You are a document analysis expert. Analyze the provided context carefully and answer the question accurately.
 
-Context:
+CRITICAL INSTRUCTIONS:
+1. Base your answer ONLY on the provided context
+2. If information exists in the context, provide the complete and accurate details
+3. If you find conflicting information, clarify the distinction
+4. If no relevant information exists, clearly state "The provided context does not contain this information"
+5. For retention periods, be precise about what applies to what - distinguish between main documents and subsidiary papers
+6. Quote specific sections when relevant
+
+CONTEXT:
 {context}
 
-Question: {query}
+QUESTION: {query}
 
-Instructions:
-- Provide a direct, specific answer based only on the context provided
-- If the context doesn't contain enough information, state that clearly
-- Include specific details like waiting periods, coverage amounts, conditions, etc.
-- Be concise but complete
+ANALYSIS STEPS:
+1. Search the context for keywords related to the question
+2. Identify the specific section/table that contains the answer
+3. Extract the exact information requested
+4. Verify accuracy before responding
 
 Answer:"""
     
@@ -626,6 +603,67 @@ Answer:"""
             weighted_scores.append(score * weight)
         
         return sum(weighted_scores) / sum(weights[:len(weighted_scores)]) if weighted_scores else 0.0
+
+    async def _validate_answer(self, answer: str, context: str, question: str) -> Dict[str, Any]:
+        """Validate answer against context and assign confidence score"""
+        
+        validation_prompt = f"""Review this answer for accuracy against the context:
+
+CONTEXT: {context[:1500]}...
+QUESTION: {question}
+ANSWER: {answer}
+
+Validation checklist:
+1. Is the answer factually correct based on the context?
+2. Are there any contradictions or mixed information?
+3. Is the answer complete?
+4. Does it properly distinguish between different document types or periods?
+
+Respond with:
+- ACCURATE/INACCURATE
+- Confidence: 0.0-1.0
+- Issues: [any problems found]
+
+Validation:"""
+        
+        try:
+            response = self.model.generate_content(
+                validation_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    max_output_tokens=200,
+                )
+            )
+            
+            validation_text = response.text.strip()
+            confidence = self._extract_confidence_from_validation(validation_text)
+            
+            return {
+                "answer": answer,
+                "confidence": confidence,
+                "validation": validation_text
+            }
+        except Exception as e:
+            logger.warning(f"Answer validation failed: {e}")
+            return {"answer": answer, "confidence": 0.7, "validation": "Not validated"}
+    
+    def _extract_confidence_from_validation(self, validation_text: str) -> float:
+        """Extract confidence score from validation response"""
+        try:
+            # Look for confidence pattern
+            confidence_match = re.search(r'confidence[:\s]*([0-9.]+)', validation_text.lower())
+            if confidence_match:
+                return min(float(confidence_match.group(1)), 1.0)
+            
+            # Fallback: check for ACCURATE/INACCURATE
+            if 'accurate' in validation_text.lower() and 'inaccurate' not in validation_text.lower():
+                return 0.8
+            elif 'inaccurate' in validation_text.lower():
+                return 0.3
+            else:
+                return 0.6
+        except:
+            return 0.6
 
 class QueryRetrievalSystem:
     """Main system orchestrating the entire 6-step pipeline"""
@@ -690,21 +728,41 @@ class QueryRetrievalSystem:
             raise
     
     async def process_queries(self, document_id: str, questions: List[str]) -> List[str]:
-        """Process multiple queries against a document - Steps 4-6"""
+        """Process multiple queries with enhanced accuracy - Steps 4-6"""
         answers = []
         
         for question in questions:
             start_time = datetime.utcnow()
             try:
-                # Step 4: Retrieve relevant chunks (clause matching)
-                context_chunks = await self.embedding_service.search_similar(question, k=5)
-                # Step 5: Generate answer (logic evaluation)
-                result = await self.llm_service.generate_answer(question, context_chunks)
-                # Store query record (stateless: skip DB)
-                answers.append(result['answer'])
+                # Step 1: Enhanced similarity search
+                context_chunks = await self.embedding_service.enhanced_similarity_search(question, top_k=Config.MAX_CHUNKS_PER_QUERY)
+                
+                # Step 2: Generate initial answer
+                initial_result = await self.llm_service.generate_answer(question, context_chunks)
+                initial_answer = initial_result['answer']
+                
+                # Step 3: Validate and refine if confidence is low
+                context_text = " ".join([chunk.get('content', '') for chunk in context_chunks])
+                validated = await self.llm_service._validate_answer(
+                    initial_answer, 
+                    context_text,
+                    question
+                )
+                
+                # Step 4: If confidence < 0.8, try with more context
+                if validated.get('confidence', 0) < 0.8:
+                    logger.info(f"Low confidence ({validated.get('confidence', 0):.2f}) for question: {question[:50]}...")
+                    extended_chunks = await self.embedding_service.enhanced_similarity_search(question, top_k=12)
+                    extended_context = " ".join([chunk.get('content', '') for chunk in extended_chunks])
+                    refined_result = await self.llm_service.generate_answer(question, extended_chunks)
+                    answers.append(refined_result['answer'])
+                else:
+                    answers.append(validated['answer'])
+                    
             except Exception as e:
                 logger.error(f"Error processing query '{question}': {e}")
-                answers.append(f"Error processing query: {str(e)}")
+                answers.append("Error processing this question. Please try again.")
+        
         return answers
 
 # FastAPI Application
@@ -734,7 +792,6 @@ async def root():
         "version": "2.0.0",
         "current_llm": Config.LLM_PROVIDER,
         "available_llms": {
-            "openai": bool(Config.OPENAI_API_KEY),
             "gemini": bool(GEMINI_AVAILABLE and Config.GEMINI_API_KEY)
         }
     }
@@ -746,7 +803,6 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "version": "2.0.0",
         "services": {
-            "openai": "available" if Config.OPENAI_API_KEY else "not configured",
             "gemini": "available" if (GEMINI_AVAILABLE and Config.GEMINI_API_KEY) else "not configured",
             "current_llm": Config.LLM_PROVIDER,
             "vector_db": "faiss" if hasattr(retrieval_system.embedding_service, 'faiss_index') else "pinecone"
@@ -788,26 +844,22 @@ async def get_available_models():
     return {
         "current_provider": Config.LLM_PROVIDER,
         "available_providers": {
-            # "openai": {
-            #     "available": bool(Config.OPENAI_API_KEY),
-            #     "model": Config.OPENAI_MODEL if Config.OPENAI_API_KEY else "not configured"
-            # },
             "gemini": {
                 "available": bool(GEMINI_AVAILABLE and Config.GEMINI_API_KEY),
                 "model": Config.GEMINI_MODEL if (GEMINI_AVAILABLE and Config.GEMINI_API_KEY) else "not configured"
             }
         },
         "workflow_integration": {
-            "step_2": "LLM Parser - Both OpenAI and Gemini supported",
-            "step_5": "Logic Evaluation - Both OpenAI and Gemini supported"
+            "step_2": "LLM Parser - Gemini supported",
+            "step_5": "Logic Evaluation - Gemini supported"
         }
     }
 
 @app.post("/switch-model")
-async def switch_model(provider: str = Query(..., description="LLM provider: 'openai' or 'gemini'")):
-    """Switch between OpenAI and Gemini (runtime switching)"""
-    if provider.lower() not in ["openai", "gemini"]:
-        raise HTTPException(status_code=400, detail="Invalid provider. Use 'openai' or 'gemini'")
+async def switch_model(provider: str = Query(..., description="LLM provider: 'gemini'")):
+    """Switch between LLM providers (Gemini only available)"""
+    if provider.lower() not in ["gemini"]:
+        raise HTTPException(status_code=400, detail="Invalid provider. Use 'gemini'")
     
     success = retrieval_system.switch_llm_provider(provider)
     
@@ -820,6 +872,44 @@ async def switch_model(provider: str = Query(..., description="LLM provider: 'op
         }
     else:
         raise HTTPException(status_code=500, detail=f"Failed to switch to {provider}. Check if it's configured.")
+
+@app.post("/debug/analyze")
+async def debug_analyze(
+    request: QueryRequest,
+    auth_key: HTTPAuthorizationCredentials = Depends(verify_hackrx_api_key)
+):
+    """Debug endpoint to analyze answer accuracy"""
+    try:
+        document_id = await retrieval_system.process_document(request.documents)
+        
+        debug_results = []
+        for question in request.questions:
+            # Get enhanced search results
+            chunks = await retrieval_system.embedding_service.enhanced_similarity_search(question, top_k=8)
+            
+            # Generate answer
+            result = await retrieval_system.llm_service.generate_answer(question, chunks)
+            answer = result['answer']
+            
+            # Validate answer
+            context_text = " ".join([chunk.get('content', '') for chunk in chunks])
+            validation = await retrieval_system.llm_service._validate_answer(answer, context_text, question)
+            
+            debug_results.append({
+                "question": question,
+                "answer": answer,
+                "confidence": validation.get('confidence', 0),
+                "validation": validation.get('validation', 'Not validated'),
+                "context_chunks": [chunk.get('content', '')[:200] + "..." for chunk in chunks],
+                "chunk_scores": [chunk.get('score', 0) for chunk in chunks],
+                "keywords_extracted": retrieval_system.embedding_service._extract_keywords(question)
+            })
+        
+        return {"debug_analysis": debug_results}
+        
+    except Exception as e:
+        logger.error(f"Debug analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Debug analysis failed: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
