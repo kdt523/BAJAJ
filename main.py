@@ -10,6 +10,7 @@ import json
 import asyncio
 import logging
 import re
+import time
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
@@ -92,6 +93,11 @@ class Config:
     # Gemini Configuration
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     GEMINI_MODEL = "gemini-2.5-flash-lite"
+    
+    # Rate limiting configuration
+    RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", "2.0"))  # Seconds between API calls
+    MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+    RETRY_DELAY = float(os.getenv("RETRY_DELAY", "5.0"))  # Seconds to wait before retry
     
     # LLM Provider Selection
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()  # "openai" or "gemini"
@@ -505,7 +511,51 @@ class GeminiService:
         genai.configure(api_key=Config.GEMINI_API_KEY)
         self.model = genai.GenerativeModel(Config.GEMINI_MODEL)
         self.provider = "gemini"
+        self.last_api_call = 0  # Track last API call time
+        self.request_count = 0  # Track number of requests
         logger.info("Gemini service initialized successfully")
+    
+    async def _rate_limited_api_call(self, prompt: str, generation_config: dict) -> str:
+        """Make rate-limited API call with retry logic"""
+        for attempt in range(Config.MAX_RETRIES):
+            try:
+                # Implement rate limiting
+                current_time = time.time()
+                time_since_last_call = current_time - self.last_api_call
+                
+                if time_since_last_call < Config.RATE_LIMIT_DELAY:
+                    sleep_time = Config.RATE_LIMIT_DELAY - time_since_last_call
+                    logger.info(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
+                    await asyncio.sleep(sleep_time)
+                
+                # Make the API call
+                response = self.model.generate_content(prompt, generation_config=generation_config)
+                self.last_api_call = time.time()
+                self.request_count += 1
+                
+                return response.text.strip()
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                
+                # Check for rate limit errors
+                if any(term in error_msg for term in ['rate limit', 'quota', 'too many requests', '429']):
+                    wait_time = Config.RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Rate limit hit (attempt {attempt + 1}/{Config.MAX_RETRIES}). Waiting {wait_time} seconds...")
+                    
+                    if attempt < Config.MAX_RETRIES - 1:
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        raise HTTPException(
+                            status_code=429, 
+                            detail="Rate limit exceeded. Please try again later."
+                        )
+                else:
+                    # For non-rate-limit errors, re-raise immediately
+                    raise e
+        
+        raise Exception("Max retries exceeded")
     
     async def generate_answer(self, query: str, context_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Generate answer using Gemini with retrieved context"""
@@ -519,16 +569,13 @@ class GeminiService:
             # Create prompt
             prompt = self._create_answer_prompt(query, context)
             
-            # Generate response using Gemini
-            response = self.model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,  # Low temperature for consistency
-                    max_output_tokens=300,  # Token-efficient response
-                )
+            # Generate response using rate-limited API call
+            generation_config = genai.types.GenerationConfig(
+                temperature=0.1,  # Low temperature for consistency
+                max_output_tokens=300,  # Token-efficient response
             )
             
-            answer = response.text.strip()
+            answer = await self._rate_limited_api_call(prompt, generation_config)
             
             # Extract reasoning and sources
             reasoning = self._extract_reasoning(context_chunks)
@@ -627,15 +674,12 @@ Respond with:
 Validation:"""
         
         try:
-            response = self.model.generate_content(
-                validation_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,
-                    max_output_tokens=200,
-                )
+            generation_config = genai.types.GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=200,
             )
             
-            validation_text = response.text.strip()
+            validation_text = await self._rate_limited_api_call(validation_prompt, generation_config)
             confidence = self._extract_confidence_from_validation(validation_text)
             
             return {
@@ -728,40 +772,47 @@ class QueryRetrievalSystem:
             raise
     
     async def process_queries(self, document_id: str, questions: List[str]) -> List[str]:
-        """Process multiple queries with enhanced accuracy - Steps 4-6"""
+        """Process multiple queries with enhanced accuracy and rate limiting - Steps 4-6"""
         answers = []
         
-        for question in questions:
-            start_time = datetime.utcnow()
-            try:
-                # Step 1: Enhanced similarity search
-                context_chunks = await self.embedding_service.enhanced_similarity_search(question, top_k=Config.MAX_CHUNKS_PER_QUERY)
-                
-                # Step 2: Generate initial answer
-                initial_result = await self.llm_service.generate_answer(question, context_chunks)
-                initial_answer = initial_result['answer']
-                
-                # Step 3: Validate and refine if confidence is low
-                context_text = " ".join([chunk.get('content', '') for chunk in context_chunks])
-                validated = await self.llm_service._validate_answer(
-                    initial_answer, 
-                    context_text,
-                    question
-                )
-                
-                # Step 4: If confidence < 0.8, try with more context
-                if validated.get('confidence', 0) < 0.8:
-                    logger.info(f"Low confidence ({validated.get('confidence', 0):.2f}) for question: {question[:50]}...")
-                    extended_chunks = await self.embedding_service.enhanced_similarity_search(question, top_k=12)
-                    extended_context = " ".join([chunk.get('content', '') for chunk in extended_chunks])
-                    refined_result = await self.llm_service.generate_answer(question, extended_chunks)
-                    answers.append(refined_result['answer'])
-                else:
-                    answers.append(validated['answer'])
+        # Process questions in batches to avoid overwhelming the API
+        batch_size = 3  # Process 3 questions at a time
+        for i in range(0, len(questions), batch_size):
+            batch_questions = questions[i:i + batch_size]
+            batch_answers = []
+            
+            for question in batch_questions:
+                start_time = datetime.utcnow()
+                try:
+                    # Step 1: Enhanced similarity search
+                    context_chunks = await self.embedding_service.enhanced_similarity_search(question, top_k=Config.MAX_CHUNKS_PER_QUERY)
                     
-            except Exception as e:
-                logger.error(f"Error processing query '{question}': {e}")
-                answers.append("Error processing this question. Please try again.")
+                    # Step 2: Generate initial answer
+                    initial_result = await self.llm_service.generate_answer(question, context_chunks)
+                    initial_answer = initial_result['answer']
+                    
+                    # Step 3: Validate and refine if confidence is low (skip validation for rate limiting)
+                    # Only validate if the initial confidence is very low
+                    initial_confidence = initial_result.get('confidence', 0.5)
+                    
+                    if initial_confidence < 0.6:  # Increased threshold to reduce API calls
+                        logger.info(f"Low confidence ({initial_confidence:.2f}) for question: {question[:50]}...")
+                        extended_chunks = await self.embedding_service.enhanced_similarity_search(question, top_k=12)
+                        refined_result = await self.llm_service.generate_answer(question, extended_chunks)
+                        batch_answers.append(refined_result['answer'])
+                    else:
+                        batch_answers.append(initial_answer)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing query '{question}': {e}")
+                    batch_answers.append("Error processing this question. Please try again.")
+            
+            answers.extend(batch_answers)
+            
+            # Add delay between batches to respect rate limits
+            if i + batch_size < len(questions):
+                logger.info(f"Processed batch {i//batch_size + 1}, waiting before next batch...")
+                await asyncio.sleep(Config.RATE_LIMIT_DELAY)
         
         return answers
 
@@ -872,6 +923,24 @@ async def switch_model(provider: str = Query(..., description="LLM provider: 'ge
         }
     else:
         raise HTTPException(status_code=500, detail=f"Failed to switch to {provider}. Check if it's configured.")
+
+@app.get("/api-stats")
+async def get_api_stats():
+    """Get API usage statistics"""
+    return {
+        "total_requests": retrieval_system.llm_service.request_count,
+        "last_api_call": retrieval_system.llm_service.last_api_call,
+        "rate_limit_config": {
+            "delay_between_calls": Config.RATE_LIMIT_DELAY,
+            "max_retries": Config.MAX_RETRIES,
+            "retry_delay": Config.RETRY_DELAY
+        },
+        "recommendations": {
+            "reduce_questions": "Process fewer questions at once",
+            "increase_delay": f"Current delay: {Config.RATE_LIMIT_DELAY}s - consider increasing",
+            "batch_processing": "Questions are processed in batches of 3"
+        }
+    }
 
 @app.post("/debug/analyze")
 async def debug_analyze(
